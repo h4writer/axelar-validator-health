@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>window.STATIC_MODE=true</script>
+<meta charset="utf-8" />
+<title>Validator healths — chain</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>
+    <a id="home-link" href="/" style="color: var(--muted)">← all chains</a>
+    <span id="title" style="margin-left:12px"></span>
+  </h1>
+  <span id="status" class="status">loading…</span>
+  <span id="view-toggle"></span>
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <div class="card">
+    <div style="display:flex; align-items:baseline; justify-content:space-between; margin-top:0">
+      <h2 style="margin:0">Vote outcomes — last 7 days</h2>
+      <span class="muted" style="font-size:12px">Drag on the chart to filter the table by time. Click without dragging to clear.</span>
+    </div>
+    <div class="chart-wrap chart-large"><canvas id="chain-chart"></canvas></div>
+  </div>
+  <div class="card">
+    <div style="display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:8px">
+      <h2 style="margin:0">Validators</h2>
+      <span id="range-badge" class="range-badge" style="display:none"></span>
+    </div>
+    <table id="vals" class="sortable">
+      <thead>
+        <tr>
+          <th data-key="moniker"      data-type="text">Moniker</th>
+          <th data-key="operator"     data-type="text">Operator</th>
+          <th data-key="voting_power" data-type="num">Stake</th>
+          <th data-key="total_polls"  data-type="num">Total</th>
+          <th data-key="yes"          data-type="num">YES</th>
+          <th data-key="no"           data-type="num">NO</th>
+          <th data-key="late"         data-type="num">LATE</th>
+          <th data-key="missed"       data-type="num">MISSED</th>
+          <th data-key="pending"      data-type="num">PENDING</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</main>
+<script>
+// Inline-parse to avoid timing dependency on app.js (which is deferred). The
+// equivalent of readChainName() — accept ?name=… (static mode) or path tail.
+const chainName = (() => {
+  const q = new URLSearchParams(location.search).get("name");
+  return q || decodeURIComponent(location.pathname.split("/").pop());
+})();
+
+// Cache so the toggle re-renders without re-fetching.
+let chainSeriesCache = null;
+// Active time filter from drag-select on the chart. null = full window.
+let selectedRange = null;
+// Selector handle returned by attachChartRangeSelector (so we can repaint after rebuilds).
+let rangeSelector = null;
+
+window.addEventListener("DOMContentLoaded", async () => {
+  hideRefreshIfStatic();
+  document.getElementById("title").textContent = chainName;
+  document.title = `${chainName} — validator healths`;
+  const statusEl = document.getElementById("status");
+  document.getElementById("refresh").onclick = (e) =>
+    doUpdate(e.target, statusEl).then(() => {
+      chainSeriesCache = null;
+      validatorsCache = [];
+      loadAll();
+    });
+  renderViewToggle(document.getElementById("view-toggle"), () => {
+    // Mode flipped — re-render chart from cache, re-render table (sort state preserved).
+    if (chainSeriesCache) {
+      const canvas = document.getElementById("chain-chart");
+      if (canvas._chart) canvas._chart.destroy();
+      canvas._chart = buildStackedAreaChart(canvas, chainSeriesCache);
+    }
+    renderValidators();
+  });
+  await refreshStatus(statusEl);
+  await loadAll();
+});
+
+async function loadAll() {
+  await loadChainChart();
+  await loadValidators();
+}
+
+async function loadChainChart() {
+  try {
+    chainSeriesCache = await getJSON(`/api/chains/${encodeURIComponent(chainName)}/series?bucket=h`);
+    const canvas = document.getElementById("chain-chart");
+    if (canvas._chart) canvas._chart.destroy();
+    canvas._chart = buildStackedAreaChart(canvas, chainSeriesCache);
+    if (!rangeSelector) {
+      rangeSelector = attachChartRangeSelector(canvas, (range) => {
+        selectedRange = range;
+        renderRangeBadge();
+        loadValidators();
+      });
+    }
+    rangeSelector.repaint();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function renderRangeBadge() {
+  const el = document.getElementById("range-badge");
+  if (!selectedRange) {
+    el.style.display = "none";
+    return;
+  }
+  el.style.display = "inline-flex";
+  el.innerHTML = `<span>Filtered: ${fmtRange(selectedRange)}</span><button class="range-clear" type="button" aria-label="clear">×</button>`;
+  el.querySelector(".range-clear").onclick = () => {
+    selectedRange = null;
+    if (rangeSelector) rangeSelector.setRange(null);
+    renderRangeBadge();
+    loadValidators();
+  };
+}
+
+// Module state for the validator table.
+let validatorsCache = [];
+let expanded = new Set();             // operators with their detail row visible
+let sortState = { key: "total_polls", dir: "desc" };
+
+async function loadValidators() {
+  const tbody = document.querySelector("#vals tbody");
+  tbody.innerHTML = "<tr><td colspan='9' class='muted'>loading…</td></tr>";
+  let url = `/api/chains/${encodeURIComponent(chainName)}/validators`;
+  if (selectedRange) {
+    url += `?from=${selectedRange.from}&to=${selectedRange.to}`;
+  }
+  let vals;
+  try {
+    vals = await getJSON(url);
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan='9'>error: ${e.message}</td></tr>`;
+    return;
+  }
+  validatorsCache = vals;
+  // Wire up sortable headers (idempotent).
+  document.querySelectorAll("#vals thead th[data-key]").forEach((th) => {
+    if (th._wired) return;
+    th._wired = true;
+    th.addEventListener("click", () => {
+      const k = th.getAttribute("data-key");
+      const type = th.getAttribute("data-type");
+      if (sortState.key === k) {
+        sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+      } else {
+        sortState.key = k;
+        sortState.dir = type === "num" ? "desc" : "asc";
+      }
+      renderValidators();
+    });
+  });
+  renderValidators();
+}
+
+function renderValidators() {
+  const tbody = document.querySelector("#vals tbody");
+  if (!validatorsCache.length) {
+    tbody.innerHTML = "<tr><td colspan='9' class='muted'>no validators</td></tr>";
+    return;
+  }
+
+  // Update sort indicators on headers.
+  document.querySelectorAll("#vals thead th[data-key]").forEach((th) => {
+    th.classList.remove("sort-asc", "sort-desc");
+    if (th.getAttribute("data-key") === sortState.key) {
+      th.classList.add(sortState.dir === "asc" ? "sort-asc" : "sort-desc");
+    }
+  });
+
+  const sorted = sortValidators(validatorsCache, sortState.key, sortState.dir);
+  // Denominator for the stake % column: total voting power of validators on this chain.
+  const totalStake = validatorsCache.reduce((a, x) => a + (x.voting_power || 0), 0);
+  tbody.innerHTML = "";
+  for (const v of sorted) {
+    const tr = document.createElement("tr");
+    tr.className = "validator-row";
+    const stakeCell = v.voting_power
+      ? `${fmtPower(v.voting_power)} <span class="muted">(${(100 * v.voting_power / totalStake).toFixed(1)}%)</span>`
+      : "<span class='muted'>—</span>";
+    // Moniker is a link to the validator detail page; clicking elsewhere on
+    // the row toggles the inline per-poll timeline (only for maintainers — non
+    // -maintainers have no per-chain timeline to show).
+    const isMaintainer = v.is_maintainer !== false;
+    const monikerLabel = v.moniker ?? "—";
+    const nonMaintainerBadge = isMaintainer
+      ? ""
+      : ` <span class="non-maintainer-badge" title="Bonded but not a maintainer of this chain. Their stake counts toward BondedWeight (the threshold denominator) but they don't vote on this chain's polls.">non-maintainer</span>`;
+    const monikerCell = `<a href="${validatorPageUrl(v.operator)}" onclick="event.stopPropagation()">${monikerLabel}</a>${nonMaintainerBadge}`;
+    if (!isMaintainer) tr.classList.add("non-maintainer-row");
+    tr.innerHTML = `
+      <td>${monikerCell}</td>
+      <td><code style="font-size:11px">${v.operator}</code></td>
+      <td>${stakeCell}</td>
+      <td>${isMaintainer ? v.total_polls : "<span class='muted'>—</span>"}</td>
+      <td>${isMaintainer ? `<span class="kpi kpi-yes">${v.yes}</span>` : "<span class='muted'>—</span>"}</td>
+      <td>${isMaintainer ? `<span class="kpi kpi-no">${v.no}</span>` : "<span class='muted'>—</span>"}</td>
+      <td>${isMaintainer ? `<span class="kpi kpi-late">${v.late}</span>` : "<span class='muted'>—</span>"}</td>
+      <td>${isMaintainer ? `<span class="kpi kpi-missed">${v.missed}</span>` : "<span class='muted'>—</span>"}</td>
+      <td>${isMaintainer ? `<span class="kpi kpi-pending">${v.pending}</span>` : "<span class='muted'>—</span>"}</td>
+    `;
+    tbody.appendChild(tr);
+    if (isMaintainer) {
+      tr.onclick = () => toggleExpand(tr, v.operator);
+      if (expanded.has(v.operator)) {
+        // Re-mount the detail row in its new position after a re-render.
+        attachExpansion(tr, v.operator);
+      }
+    }
+  }
+}
+
+async function toggleExpand(tr, operator) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("expanded-row")) {
+    next.remove();
+    expanded.delete(operator);
+    return;
+  }
+  expanded.add(operator);
+  await attachExpansion(tr, operator);
+}
+
+async function attachExpansion(tr, operator) {
+  if (tr.nextElementSibling && tr.nextElementSibling.classList.contains("expanded-row")) {
+    return;
+  }
+  const row = document.createElement("tr");
+  row.className = "expanded-row";
+  const td = document.createElement("td");
+  td.colSpan = 9;
+  td.innerHTML = `<div class="chart-wrap chart-large"><canvas></canvas></div>`;
+  row.appendChild(td);
+  tr.after(row);
+  try {
+    const points = await getJSON(`/api/validators/${encodeURIComponent(operator)}/series?chain=${encodeURIComponent(chainName)}`);
+    buildValidatorTimeline(row.querySelector("canvas"), points);
+  } catch (e) {
+    td.innerHTML = `<span class='muted'>error: ${e.message}</span>`;
+  }
+}
+
+function sortValidators(rows, key, dir) {
+  const out = rows.slice();
+  const sign = dir === "asc" ? 1 : -1;
+  out.sort((a, b) => {
+    // Always keep maintainers above non-maintainers regardless of sort key —
+    // mixing them creates confusion (their vote columns are all dashes).
+    const am = a.is_maintainer === false ? 1 : 0;
+    const bm = b.is_maintainer === false ? 1 : 0;
+    if (am !== bm) return am - bm;
+
+    let av = a[key];
+    let bv = b[key];
+    if (key === "moniker") {
+      const aMissing = av == null || av === "";
+      const bMissing = bv == null || bv === "";
+      if (aMissing && !bMissing) return 1;
+      if (!aMissing && bMissing) return -1;
+      if (aMissing && bMissing) return 0;
+      return sign * av.toLowerCase().localeCompare(bv.toLowerCase());
+    }
+    if (typeof av === "string" || typeof bv === "string") {
+      return sign * String(av ?? "").localeCompare(String(bv ?? ""));
+    }
+    return sign * ((av ?? 0) - (bv ?? 0));
+  });
+  return out;
+}
+
+</script>
+</body>
+</html>
