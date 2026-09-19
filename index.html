@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>window.STATIC_MODE=true</script>
+<meta charset="utf-8" />
+<title>Validator healths — chains</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>Validator healths</h1>
+  <span id="status" class="status">loading…</span>
+  <span class="legend">
+    <span><span class="legend-dot lg-yes"></span>YES</span>
+    <span><span class="legend-dot lg-no"></span>NO</span>
+    <span><span class="legend-dot lg-late"></span>LATE</span>
+    <span><span class="legend-dot lg-missed"></span>MISSED</span>
+    <span><span class="legend-dot lg-pending"></span>PENDING</span>
+  </span>
+  <span id="view-toggle"></span>
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <div id="chains" class="chains-grid"></div>
+</main>
+<script>
+// Cache so we can re-render KPIs/charts on toggle without re-fetching.
+let chainsCache = null;
+const seriesCache = new Map();
+
+window.addEventListener("DOMContentLoaded", async () => {
+  hideRefreshIfStatic();
+  const statusEl = document.getElementById("status");
+  document.getElementById("refresh").onclick = (e) => doUpdate(e.target, statusEl).then(reload);
+  renderViewToggle(document.getElementById("view-toggle"), () => renderChains());
+  await refreshStatus(statusEl);
+  await reload();
+});
+
+async function reload() {
+  chainsCache = null;
+  seriesCache.clear();
+  await renderChains();
+}
+
+async function renderChains() {
+  const el = document.getElementById("chains");
+  if (!chainsCache) {
+    el.innerHTML = "<div class='card muted'>Loading chain summaries…</div>";
+    try {
+      chainsCache = await getJSON("/api/chains");
+    } catch (e) {
+      el.innerHTML = `<div class='card'>Failed to load chains: ${e.message}</div>`;
+      return;
+    }
+  }
+  if (!chainsCache.length) {
+    el.innerHTML = "<div class='card muted'>No data yet. Click Refresh to start indexing.</div>";
+    return;
+  }
+  const mode = getViewMode();
+  el.innerHTML = "";
+  for (const c of chainsCache) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const denom = totalFor(c, mode) || 1;
+    // In stake / future modes the `*_power` fields hold the chain's quadratic
+    // snapshot weight (units of √consensus_power, small integers). Display as
+    // raw integer; it isn't a stake amount anymore.
+    const pendingDisplay =
+      mode === "future" ? c.pending_future_power :
+      mode === "stake"  ? c.pending_power :
+                          c.pending;
+    card.innerHTML = `
+      <div class="chain-card-title">
+        <h2><a href="${chainPageUrl(c.chain)}">${c.chain}</a></h2>
+        <span class="stats">${c.total_polls} polls • last ${fmtTs(c.latest_poll_at)}</span>
+      </div>
+      <div style="margin-bottom:10px">
+        <span class="kpi kpi-yes">YES ${pct(valFor(c, "YES", mode), denom)}</span>
+        <span class="kpi kpi-no">NO ${pct(valFor(c, "NO", mode), denom)}</span>
+        <span class="kpi kpi-late">LATE ${pct(valFor(c, "LATE", mode), denom)}</span>
+        <span class="kpi kpi-missed">MISSED ${pct(valFor(c, "MISSED", mode), denom)}</span>
+        <span class="kpi kpi-pending">PENDING ${pendingDisplay}</span>
+      </div>
+      <div class="chart-wrap"><canvas></canvas></div>
+    `;
+    el.appendChild(card);
+    const canvas = card.querySelector("canvas");
+    try {
+      let buckets = seriesCache.get(c.chain);
+      if (!buckets) {
+        buckets = await getJSON(`/api/chains/${encodeURIComponent(c.chain)}/series?bucket=h`);
+        seriesCache.set(c.chain, buckets);
+      }
+      buildStackedAreaChart(canvas, buckets);
+    } catch (e) {
+      canvas.replaceWith(Object.assign(document.createElement("div"), { textContent: `chart error: ${e.message}`, className: "muted" }));
+    }
+  }
+}
+</script>
+</body>
+</html>
