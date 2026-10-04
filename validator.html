@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>window.STATIC_MODE=true</script>
+<meta charset="utf-8" />
+<title>Validator healths — validator</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>
+    <a id="home-link" href="/" style="color: var(--muted)">← all chains</a>
+    <span id="title" style="margin-left:12px"></span>
+  </h1>
+  <span id="status" class="status">loading…</span>
+  <span id="view-toggle"></span>
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <div class="card" id="overview-card">
+    <div class="muted">loading validator…</div>
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">Per-chain breakdown</h2>
+    <table id="chains-tbl" class="sortable">
+      <thead>
+        <tr>
+          <th data-key="chain"       data-type="text">Chain</th>
+          <th data-key="total_polls" data-type="num">Total</th>
+          <th data-key="yes"         data-type="num">YES</th>
+          <th data-key="no"          data-type="num">NO</th>
+          <th data-key="late"        data-type="num">LATE</th>
+          <th data-key="missed"      data-type="num">MISSED</th>
+          <th data-key="pending"     data-type="num">PENDING</th>
+          <th data-key="yes_total_pct" data-type="num">YES / Total</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</main>
+<script>
+// Inline-parse to avoid timing dependency on app.js (which is deferred). The
+// equivalent of readOperator() — accept ?op=… (static mode) or path tail.
+const operator = (() => {
+  const q = new URLSearchParams(location.search).get("op");
+  return q || decodeURIComponent(location.pathname.split("/").pop());
+})();
+
+let chainsCache = [];
+let expanded = new Set();
+let sortState = { key: "total_polls", dir: "desc" };
+let overviewCache = null;
+
+window.addEventListener("DOMContentLoaded", async () => {
+  hideRefreshIfStatic();
+  document.getElementById("title").textContent = operator;
+  document.title = `${operator} — validator healths`;
+  const statusEl = document.getElementById("status");
+  document.getElementById("refresh").onclick = (e) =>
+    doUpdate(e.target, statusEl).then(loadAll);
+  // The toggle exists for consistency, but this page's table is per-validator
+  // (one row = this validator on one chain) so count vs stake doesn't change
+  // the displayed numbers. Re-renders are still wired so the user can flip it
+  // without a layout glitch.
+  renderViewToggle(document.getElementById("view-toggle"), () => render());
+  await refreshStatus(statusEl);
+  await loadAll();
+});
+
+async function loadAll() {
+  await loadOverview();
+  await loadChains();
+}
+
+async function loadOverview() {
+  const card = document.getElementById("overview-card");
+  try {
+    overviewCache = await getJSON(`/api/validators/${encodeURIComponent(operator)}`);
+  } catch (e) {
+    card.innerHTML = `<div>error: ${e.message}</div>`;
+    return;
+  }
+  renderOverview();
+}
+
+function renderOverview() {
+  const card = document.getElementById("overview-card");
+  const v = overviewCache;
+  if (!v) return;
+  const denom = (v.yes + v.no + v.late + v.missed) || 1;
+  const pct = (n) => `${(100 * n / denom).toFixed(1)}%`;
+  card.innerHTML = `
+    <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:12px">
+      <div>
+        <h2 style="margin:0">${v.moniker ?? "<span class='muted'>(unknown moniker)</span>"}</h2>
+        <div class="muted" style="font-size:12px; margin-top:2px"><code>${v.operator}</code></div>
+        ${v.proxy ? `<div class="muted" style="font-size:12px">proxy: <code>${v.proxy}</code></div>` : ""}
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:18px">${v.voting_power ? fmtPower(v.voting_power) + " AXL" : "—"}</div>
+        <div class="muted" style="font-size:12px">bonded stake</div>
+      </div>
+    </div>
+    <div>
+      <span class="kpi kpi-yes">YES ${pct(v.yes)}</span>
+      <span class="kpi kpi-no">NO ${pct(v.no)}</span>
+      <span class="kpi kpi-late">LATE ${pct(v.late)}</span>
+      <span class="kpi kpi-missed">MISSED ${pct(v.missed)}</span>
+      <span class="kpi kpi-pending">PENDING ${v.pending}</span>
+      <span class="muted" style="margin-left:12px">${v.total_polls} polls in window</span>
+    </div>
+  `;
+}
+
+async function loadChains() {
+  const tbody = document.querySelector("#chains-tbl tbody");
+  tbody.innerHTML = "<tr><td colspan='8' class='muted'>loading…</td></tr>";
+  try {
+    chainsCache = await getJSON(`/api/validators/${encodeURIComponent(operator)}/chains`);
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan='8'>error: ${e.message}</td></tr>`;
+    return;
+  }
+  // Augment with derived YES rate (yes / total) so it can be sorted on.
+  chainsCache.forEach((c) => {
+    const denom = (c.yes + c.no + c.late + c.missed) || 0;
+    c.yes_total_pct = denom > 0 ? c.yes / denom : 0;
+  });
+  // Wire headers (idempotent).
+  document.querySelectorAll("#chains-tbl thead th[data-key]").forEach((th) => {
+    if (th._wired) return;
+    th._wired = true;
+    th.addEventListener("click", () => {
+      const k = th.getAttribute("data-key");
+      const type = th.getAttribute("data-type");
+      if (sortState.key === k) {
+        sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+      } else {
+        sortState.key = k;
+        sortState.dir = type === "num" ? "desc" : "asc";
+      }
+      render();
+    });
+  });
+  render();
+}
+
+function render() {
+  renderOverview();
+  const tbody = document.querySelector("#chains-tbl tbody");
+  if (!chainsCache.length) {
+    tbody.innerHTML = "<tr><td colspan='8' class='muted'>no data for this validator</td></tr>";
+    return;
+  }
+  document.querySelectorAll("#chains-tbl thead th[data-key]").forEach((th) => {
+    th.classList.remove("sort-asc", "sort-desc");
+    if (th.getAttribute("data-key") === sortState.key) {
+      th.classList.add(sortState.dir === "asc" ? "sort-asc" : "sort-desc");
+    }
+  });
+  const sorted = sortRows(chainsCache, sortState.key, sortState.dir);
+  tbody.innerHTML = "";
+  for (const c of sorted) {
+    const tr = document.createElement("tr");
+    tr.className = "validator-row"; // reuse hover/cursor styling
+    const denom = c.yes + c.no + c.late + c.missed;
+    const yesTotal =
+      denom > 0
+        ? `${(100 * c.yes_total_pct).toFixed(1)}%`
+        : "<span class='muted'>—</span>";
+    tr.innerHTML = `
+      <td><a href="${chainPageUrl(c.chain)}" onclick="event.stopPropagation()">${c.chain}</a></td>
+      <td>${c.total_polls}</td>
+      <td><span class="kpi kpi-yes">${c.yes}</span></td>
+      <td><span class="kpi kpi-no">${c.no}</span></td>
+      <td><span class="kpi kpi-late">${c.late}</span></td>
+      <td><span class="kpi kpi-missed">${c.missed}</span></td>
+      <td><span class="kpi kpi-pending">${c.pending}</span></td>
+      <td>${yesTotal}</td>
+    `;
+    tbody.appendChild(tr);
+    tr.onclick = () => toggleExpand(tr, c.chain);
+    if (expanded.has(c.chain)) attachExpansion(tr, c.chain);
+  }
+}
+
+function sortRows(rows, key, dir) {
+  const out = rows.slice();
+  const sign = dir === "asc" ? 1 : -1;
+  out.sort((a, b) => {
+    let av = a[key];
+    let bv = b[key];
+    if (typeof av === "string" || typeof bv === "string") {
+      return sign * String(av ?? "").localeCompare(String(bv ?? ""));
+    }
+    return sign * ((av ?? 0) - (bv ?? 0));
+  });
+  return out;
+}
+
+async function toggleExpand(tr, chain) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("expanded-row")) {
+    next.remove();
+    expanded.delete(chain);
+    return;
+  }
+  expanded.add(chain);
+  await attachExpansion(tr, chain);
+}
+
+async function attachExpansion(tr, chain) {
+  if (tr.nextElementSibling && tr.nextElementSibling.classList.contains("expanded-row")) return;
+  const row = document.createElement("tr");
+  row.className = "expanded-row";
+  const td = document.createElement("td");
+  td.colSpan = 8;
+  td.innerHTML = `<div class="chart-wrap chart-large"><canvas></canvas></div>`;
+  row.appendChild(td);
+  tr.after(row);
+  try {
+    const points = await getJSON(`/api/validators/${encodeURIComponent(operator)}/series?chain=${encodeURIComponent(chain)}`);
+    buildValidatorTimeline(row.querySelector("canvas"), points);
+  } catch (e) {
+    td.innerHTML = `<span class='muted'>error: ${e.message}</span>`;
+  }
+}
+</script>
+</body>
+</html>
